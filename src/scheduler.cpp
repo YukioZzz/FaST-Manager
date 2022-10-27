@@ -264,6 +264,15 @@ void monitor_file(const char *path, const char *filename) {
   close(fd);
 }
 
+
+bool operator <(const timespec& lhs, const timespec& rhs)
+{
+    if (lhs.tv_sec == rhs.tv_sec)
+        return lhs.tv_nsec < rhs.tv_nsec;
+    else
+        return lhs.tv_sec < rhs.tv_sec;
+}
+
 /**
  * Select a candidate whose current usage is less than its limit.
  * If no such candidates, calculate the time until time window content changes and sleep until then,
@@ -465,6 +474,10 @@ void *schedule_daemon_func(void *) {
   std::uniform_real_distribution<double> dis(0.4, 1.0);
 #endif
   double quota;
+  int tokenLimit = 5;
+  int tokenNum = 0;
+  std::list<timespec> tokens;
+  //std::unordered_map<string, bool> scheduler_table;//@todo: remove evicted pod
 
   while (1) {
     pthread_mutex_lock(&candidate_mutex);
@@ -499,23 +512,46 @@ void *schedule_daemon_func(void *) {
     
 
       struct timespec ts = get_timespec_after(quota);
+      tokens.push_back(ts);
+      //if exceeded, then clear expired tokens
+      bool should_wait = false;
+      if (tokens.size()==5){
+          struct timespec cur_ts, min_ts;
+          clock_gettime(CLOCK_MONOTONIC, &cur_ts);
+	  min_ts = ts;
+	  auto iter = tokens.begin();
+          while(iter!=tokens.end()){
+	      if(*iter < cur_ts){ //expired
+	          tokens.erase(iter++);
+	      }else{
+                  min_ts = std::min(*iter, min_ts); 
+		  iter++;
+	      }
+	  } 
+          if (tokens.size()==5){
+              should_wait = true;
+              ts = min_ts;
+          }
+      }
 
       // wait until the selected one's quota time out
-      bool should_wait = true;
       pthread_mutex_lock(&candidate_mutex);
       while (should_wait) {
         int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
+	//just wait at then; in most cases, it's ok
         if (rc == ETIMEDOUT) {
-          DEBUG(log_name, __FILE__, (long)__LINE__, "%s didn't return on time", selected.name.c_str());
+          //DEBUG(log_name, __FILE__, (long)__LINE__, "the first didn't return on time");
           should_wait = false;
         } else {
+	  ///return too early
           // check if the selected one comes back
-          for (auto conn : candidates) {
-            if (conn.name == selected.name) {
-              should_wait = false;
-              break;
-            }
-          }
+          ///for (auto conn : candidates) {
+          ///  if (conn.name == selected.name) {
+          ///  //if (scheduler_table[conn.name]) { // if it is one of the given token
+          ///    should_wait = false;
+          ///    break;
+          ///  }
+          ///}
         }
       }
       pthread_mutex_unlock(&candidate_mutex);
