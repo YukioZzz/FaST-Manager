@@ -97,7 +97,7 @@ struct hookInfo {
     if (envHookDebug && envHookDebug[0] == '1')
       debug_mode = 1;
     else
-      debug_mode = 0;
+      debug_mode = 1;
   }
 };
 
@@ -251,8 +251,8 @@ void configure_connection() {
   char *port = getenv("POD_MANAGER_PORT");
   if (port != NULL) pod_manager_port = atoi(port);
 
-  hDEBUG(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
-  hINFO(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
+  DEBUG(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
+  //INFO(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
 }
 
 int attempt_connection(int __fd, __CONST_SOCKADDR_ARG __addr, socklen_t __len) {
@@ -312,11 +312,11 @@ int communicate(char *sbuf, char *rbuf, int socket_timeout) {
   rc = multiple_attempt(
       [&]() -> int {
         if (send(sockfd, sbuf, REQ_MSG_LEN, 0) == -1){
-          hDEBUG(log_name, __FILE__, (long)__LINE__, "multiple_attempt send error %s", strerror(errno));
+          DEBUG(log_name, __FILE__, (long)__LINE__, "multiple_attempt send error %s", strerror(errno));
           return -1;
         }
         if (recv(sockfd, rbuf, RSP_MSG_LEN, 0) == -1){
-          hDEBUG(log_name, __FILE__, (long)__LINE__, "multiple_attempt recv error %s", strerror(errno));
+          DEBUG(log_name, __FILE__, (long)__LINE__, "multiple_attempt recv error %s", strerror(errno));
           return -1;
         }
         return 0;
@@ -333,7 +333,7 @@ int communicate(char *sbuf, char *rbuf, int socket_timeout) {
  */
 void host_sync_call(const char *func_name) {
 #ifdef SYNCP_MESSAGE
-  hDEBUG(log_name, __FILE__, (long)__LINE__, "SYNC (%s)", func_name);
+  DEBUG(log_name, __FILE__, (long)__LINE__, "SYNC (%s)", func_name);
 #endif
   burst_predictor.record_stop();
   window_predictor.record_start();
@@ -412,7 +412,7 @@ double estimate_full_burst(double measured_burst, double measured_window) {
     if (measured_window < SCHD_OVERHEAD) full_burst *= 2;  // '2' can be changed to any value > 1
   }
 
-  hDEBUG(log_name, __FILE__, (long)__LINE__, "measured burst: %.3f ms, window: %.3f ms, estimated full burst: %.3f ms", measured_burst,
+  DEBUG(log_name, __FILE__, (long)__LINE__, "measured burst: %.3f ms, window: %.3f ms, estimated full burst: %.3f ms", measured_burst,
         measured_window, full_burst);
   return full_burst;
 }
@@ -441,7 +441,7 @@ double get_token_from_scheduler(double next_burst) {
   attached = parse_response(rbuf, nullptr);
   new_quota = get_msg_data<double>(attached, rpos);
 
-  hDEBUG(log_name, __FILE__, (long)__LINE__, "Get token from scheduler, quota: %f", new_quota);
+  DEBUG(log_name, __FILE__, (long)__LINE__, "Get token from scheduler, quota: %f", new_quota);
   return new_quota;
 }
 
@@ -474,7 +474,7 @@ void *wait_cuda_kernels(void *args) {
     pthread_mutex_lock(&overuse_trk_mutex);
     int rc = pthread_cond_timedwait(&overuse_trk_intr_cond, &overuse_trk_mutex, &ts);
     if (rc != ETIMEDOUT) {
-      hDEBUG(log_name, __FILE__, (long)__LINE__, "overuse tracking thread interrupted");
+      DEBUG(log_name, __FILE__, (long)__LINE__, "overuse tracking thread interrupted");
     }
     pthread_mutex_unlock(&overuse_trk_mutex);
 
@@ -491,7 +491,7 @@ void *wait_cuda_kernels(void *args) {
     cudaEventElapsedTime(&elapsed_ms, cuevent_start, event);
     overuse = std::max(0.0, (double)elapsed_ms - quota_time);
 
-    hDEBUG(log_name, __FILE__, (long)__LINE__, "overuse: %.3f ms", overuse);
+    DEBUG(log_name, __FILE__, (long)__LINE__, "overuse: %.3f ms", overuse);
     // notify tracking complete
     pthread_mutex_lock(&overuse_trk_mutex);
     overuse_trk_cmpl = true;
@@ -517,6 +517,7 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
   pthread_mutex_lock(&expiration_status_mutex);
   // allow the kernel to launch if kernel burst already begins;
   // otherwise, obtain a new token if this kernel burst may cause overuse
+  DEBUG(log_name, __FILE__, (long)__LINE__, "estimitaed_burst_time: %ld", us_since(request_start) / 1e3 + burst_predictor.predict_unmerged());
   if (!burst_predictor.ongoing_unmerged() &&
       us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
     // estimate the duration of next kernel burst (merged)
@@ -570,7 +571,7 @@ CUresult cuLaunchCooperativeKernel_prehook(CUfunction f, unsigned int gridDimX,
 CUresult cuMemFree_prehook(CUdeviceptr ptr) {
   pthread_mutex_lock(&allocation_mutex);
   if (allocation_map.find(ptr) == allocation_map.end()) {
-    hDEBUG(log_name, __FILE__, (long)__LINE__, "Freeing unknown memory! %zx", ptr);
+    DEBUG(log_name, __FILE__, (long)__LINE__, "Freeing unknown memory! %zx", ptr);
   } else {
     gpu_mem_used -= allocation_map[ptr];
     update_memory_usage(allocation_map[ptr], 0);
@@ -772,12 +773,21 @@ void initialize() {
 
 CUstream hStream;  // redundent variable used for macro expansion
 //generate hook for cuda < 11.3
+
+//    if (strcmp(CUDA_SYMBOL_STRING(funcname), "cuMemcpyHtoD")==0||                         \
+//	strcmp(CUDA_SYMBOL_STRING(funcname), "cuMemcpyDtoH")==0||                         \
+//	strcmp(CUDA_SYMBOL_STRING(funcname), "cuMemcpyAtoD")==0||                         \
+//	strcmp(CUDA_SYMBOL_STRING(funcname), "cuMemcpyDtoA")==0) {                        \
+//	    result = CUDA_SUCCESS;                                                        \
+//    }else                                                                                 \
+
 #define CU_HOOK_GENERATE_INTERCEPT(hook_name, hooksymbol, funcname, params, ...)                     \
   CUresult CUDAAPI hook_name params {                                                      \
-    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
-    static void *real_func = (void *)real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(funcname)); \
+    static void *real_func;                                                               \
+    real_func = (void *)real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(funcname));          \
     CUresult result = CUDA_SUCCESS;                                                       \
                                                                                           \
     if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
@@ -793,7 +803,28 @@ CUstream hStream;  // redundent variable used for macro expansion
                                                                                           \
     return (result);                                                                      \
   }                                                                                       
-
+#define CU_HOOK_GENERATE_INTERCEPT_managed(hook_name, hooksymbol, funcname, params, ...)                     \
+  CUresult CUDAAPI hook_name params {                                                      \
+    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    pthread_once(&init_done, initialize);                                                 \
+                                                                                          \
+    static void *real_func;                                                               \
+    real_func = (void *)real_dlsym(RTLD_NEXT, "cuMemAllocManaged");          \
+    CUresult result = CUDA_SUCCESS;                                                       \
+                                                                                          \
+    if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
+                                                                                          \
+    if (hook_inf.preHooks[hooksymbol])                                                    \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.preHooks[hooksymbol])(__VA_ARGS__);  \
+    if (result != CUDA_SUCCESS) return (result);                                          \
+                                                                                          \
+    result = ((CUresult CUDAAPI(*) (CUdeviceptr * dptr, size_t bytesize, unsigned int flags))real_func)(__VA_ARGS__, CU_MEM_ATTACH_GLOBAL);                        \
+                                                                                          \
+    if (hook_inf.postHooks[hooksymbol] && result == CUDA_SUCCESS)                         \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.postHooks[hooksymbol])(__VA_ARGS__); \
+                                                                                          \
+    return (result);                                                                      \
+  }
 CU_HOOK_GENERATE_INTERCEPT(hook_cuMemcpyAtoH, CU_HOOK_MEMCPY_ATOH, cuMemcpyAtoH,
                            (void *dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount),
                            dstHost, srcArray, srcOffset, ByteCount)
@@ -810,7 +841,7 @@ CU_HOOK_GENERATE_INTERCEPT(hook_cuMemcpyHtoD, CU_HOOK_MEMCPY_HTOD, cuMemcpyHtoD,
 CU_HOOK_GENERATE_INTERCEPT(hook_cuCtxSynchronize, CU_HOOK_CTX_SYNC, cuCtxSynchronize, (void))
 
 // cuda driver alloc/free APIs
-CU_HOOK_GENERATE_INTERCEPT(hook_cuMemAlloc, CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
+CU_HOOK_GENERATE_INTERCEPT_managed(hook_cuMemAlloc, CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
                            dptr, bytesize)
 CU_HOOK_GENERATE_INTERCEPT(hook_cuMemAllocManaged, CU_HOOK_MEM_ALLOC_MANAGED, cuMemAllocManaged,
                            (CUdeviceptr * dptr, size_t bytesize, unsigned int flags), dptr,
@@ -982,10 +1013,11 @@ CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersio
 //generate hook for cuda >= 11.3
 #define CU_HOOK_GENERATE_INTERCEPT_v1(hooksymbol, funcname, params, ...)                     \
   CUresult CUDAAPI funcname params {                                                      \
-    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
-    static void *real_func = (void *)real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(funcname)); \
+    static void *real_func;                                                               \
+    real_func = (void *)real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(funcname));          \
     CUresult result = CUDA_SUCCESS;                                                       \
                                                                                           \
     if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
@@ -1001,6 +1033,30 @@ CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersio
                                                                                           \
     return (result);                                                                      \
   }
+
+
+#define CU_HOOK_GENERATE_INTERCEPT_v1_managed(hooksymbol, funcname, params, ...)                     \
+  CUresult CUDAAPI funcname params {                                                      \
+    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    pthread_once(&init_done, initialize);                                                 \
+                                                                                          \
+    static void *real_func = (void *)real_dlsym(RTLD_NEXT, "cuMemAllocManaged");          \
+    CUresult result = CUDA_SUCCESS;                                                       \
+                                                                                          \
+    if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
+                                                                                          \
+    if (hook_inf.preHooks[hooksymbol])                                                    \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.preHooks[hooksymbol])(__VA_ARGS__);  \
+    if (result != CUDA_SUCCESS) return (result);                                          \
+                                                                                          \
+    result = ((CUresult CUDAAPI(*) (CUdeviceptr * dptr, size_t bytesize, unsigned int flags))real_func)(__VA_ARGS__, CU_MEM_ATTACH_GLOBAL);                        \
+                                                                                          \
+    if (hook_inf.postHooks[hooksymbol] && result == CUDA_SUCCESS)                         \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.postHooks[hooksymbol])(__VA_ARGS__); \
+                                                                                          \
+    return (result);                                                                      \
+  }
+
 
 CU_HOOK_GENERATE_INTERCEPT_v1(CU_HOOK_MEMCPY_ATOH, cuMemcpyAtoH,
                            (void *dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount),
@@ -1018,7 +1074,7 @@ CU_HOOK_GENERATE_INTERCEPT_v1(CU_HOOK_MEMCPY_HTOD, cuMemcpyHtoD,
 CU_HOOK_GENERATE_INTERCEPT_v1(CU_HOOK_CTX_SYNC, cuCtxSynchronize, (void))
 
 // cuda driver alloc/free APIs
-CU_HOOK_GENERATE_INTERCEPT_v1(CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
+CU_HOOK_GENERATE_INTERCEPT_v1_managed(CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
                            dptr, bytesize)
 CU_HOOK_GENERATE_INTERCEPT_v1(CU_HOOK_MEM_ALLOC_MANAGED, cuMemAllocManaged,
                            (CUdeviceptr * dptr, size_t bytesize, unsigned int flags), dptr,
