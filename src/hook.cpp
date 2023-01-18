@@ -36,6 +36,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <signal.h>
 
 
 #include <climits>
@@ -47,8 +48,10 @@
 #include <iostream>
 #include <map>
 #include <queue>
+#include <list>
 #include <random>
 #include <sstream>
+#include <algorithm>
 
 #include "comm.h"
 #include "debug.h"
@@ -192,6 +195,7 @@ bool overuse_trk_cmpl;
 // GPU memory allocation information
 pthread_mutex_t allocation_mutex = PTHREAD_MUTEX_INITIALIZER;
 std::map<CUdeviceptr, size_t> allocation_map;
+std::list<std::tuple<CUdeviceptr, size_t, CUdevice>> devptrs_mngr;
 size_t gpu_mem_used = 0;  // local accounting only
 
 /**
@@ -576,6 +580,11 @@ CUresult cuMemFree_prehook(CUdeviceptr ptr) {
     gpu_mem_used -= allocation_map[ptr];
     update_memory_usage(allocation_map[ptr], 0);
     allocation_map.erase(ptr);
+    devptrs_mngr.erase(
+      std::remove_if(devptrs_mngr.begin(), devptrs_mngr.end(),
+        [ptr](std::tuple<CUdeviceptr, size_t, CUdevice>& x) { return (std::get<0>(x) == ptr); }
+      )
+    );
   }
   pthread_mutex_unlock(&allocation_mutex);
   return CUDA_SUCCESS;
@@ -619,12 +628,24 @@ CUresult cuMemAlloc_posthook(CUdeviceptr *dptr, size_t bytesize) {
 
 CUresult cuMemAllocManaged_prehook(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
   // TODO: This function access the unified memory. Behavior needs clarification.
+  cuMemAlloc_prehook(dptr, bytesize);
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemAllocManaged_posthook(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
   // TODO: This function access the unified memory. Behavior needs clarification.
-  return CUDA_SUCCESS;
+  cuMemAlloc_posthook(dptr, bytesize);
+  int deviceNum;
+  cudaError_t err = cudaGetDevice(&deviceNum);
+  if (err != cudaSuccess) {
+      printf("Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+  }
+  CUdevice currentDevice;
+  CUresult result = cuDeviceGet(&currentDevice, deviceNum);
+  if (result == CUDA_SUCCESS)
+    devptrs_mngr.push_back(std::make_tuple(*dptr, bytesize, currentDevice));
+  return result;
 }
 
 CUresult cuMemAllocPitch_prehook(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes,
@@ -722,6 +743,21 @@ CUresult cuMemcpyHtoD_posthook(CUarray dstArray, size_t dstOffset, const void *s
   return CUDA_SUCCESS;
 }
 
+//sigint stop the program, so we advise the ptr to the host
+void sigintHandler( int signum ) {
+  std::cout << "Interrupt signal (" << signum << ") received. STOP the program.\n";
+  for(auto devptrInfo:devptrs_mngr){
+    cuMemPrefetchAsync(std::get<0>(devptrInfo), std::get<1>(devptrInfo), CU_DEVICE_CPU, 0);
+  }
+  cudaDeviceSynchronize();
+}
+void sigcontHandler( int signum ) {
+  std::cout << "Interrupt signal (" << signum << ") received. CONTINUE the program.\n";
+  for(auto devptrInfo:devptrs_mngr){
+    cuMemPrefetchAsync(std::get<0>(devptrInfo), std::get<1>(devptrInfo), std::get<2>(devptrInfo), 0);
+  }
+  cudaDeviceSynchronize();
+}
 void initialize() {
   // place post-hooks
   hook_inf.postHooks[CU_HOOK_MEMCPY_ATOH] = (void *)cuMemcpyAtoH_posthook;
@@ -769,6 +805,10 @@ void initialize() {
   get_token_from_scheduler(0.0);
 
   pthread_mutex_unlock(&request_time_mutex);
+
+   // register signal SIGINT and signal handler  
+   signal(SIGINT, sigintHandler);  
+   signal(SIGCONT, sigcontHandler);  
 }
 
 CUstream hStream;  // redundent variable used for macro expansion
