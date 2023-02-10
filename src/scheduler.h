@@ -32,6 +32,7 @@ struct History {
 // some bias used for self-adaptive quota calculation
 const double EXTRA_QUOTA = 10.0;
 const double SCHD_OVERHEAD = 2.0;
+const int SM_GLOBAL_LIMIT = 100;
 
 class ClientInfo {
  public:
@@ -45,7 +46,9 @@ class ClientInfo {
   double get_quota();
   std::map<unsigned long long, size_t> memory_map;
   std::string name;
+  size_t gpu_mem_used = 0;
   size_t gpu_mem_limit;
+  size_t gpu_sm_partition;
 
  private:
   const double MIN_FRAC;    // min percentage of GPU compute resource usage

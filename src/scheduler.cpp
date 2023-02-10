@@ -90,6 +90,7 @@ struct timespec get_timespec_after(double ms) {
 double QUOTA = 250.0;
 double MIN_QUOTA = 100.0;
 double WINDOW_SIZE = 10000.0;
+size_t g_sm_occupied = 0;
 int verbosity = 0;
 char* log_name = "/kubeshare/log/gemini-scheduler.log";
 #define EVENT_SIZE sizeof(struct inotify_event)
@@ -184,7 +185,7 @@ void read_resource_config() {
   std::ifstream fin;
   ClientInfo *client_inf;
   char client_name[HOST_NAME_MAX], full_path[PATH_MAX];
-  size_t gpu_memory_size;
+  size_t gpu_memory_size, sm_partition;
   double gpu_min_fraction, gpu_max_fraction;
   int container_num;
 
@@ -202,16 +203,17 @@ void read_resource_config() {
   fin >> container_num;
   INFO(log_name, __FILE__, (long)__LINE__, "There are %d clients in the system...", container_num);
   for (int i = 0; i < container_num; i++) {
-    fin >> client_name >> gpu_min_fraction >> gpu_max_fraction >> gpu_memory_size;
+    fin >> client_name >> gpu_min_fraction >> gpu_max_fraction >> gpu_memory_size >> sm_partition;
     client_inf = new ClientInfo(QUOTA, MIN_QUOTA, gpu_max_fraction * WINDOW_SIZE, gpu_min_fraction,
                                 gpu_max_fraction);
     client_inf->name = client_name;
     client_inf->gpu_mem_limit = gpu_memory_size;
+    client_inf->gpu_sm_partition = sm_partition;
     if (client_info_map.find(client_name) != client_info_map.end())
       delete client_info_map[client_name];
     client_info_map[client_name] = client_inf;
-    INFO(log_name, __FILE__, (long)__LINE__, "%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, gpu_min_fraction,
-         gpu_max_fraction, gpu_memory_size);
+    INFO(log_name, __FILE__, (long)__LINE__, "%s request: %.2f, limit: %.2f, memory limit: %lu bytes, sm_partition: %lu\%", client_name, gpu_min_fraction,
+         gpu_max_fraction, gpu_memory_size, sm_partition);
   }
   fin.close();
 }
@@ -264,15 +266,6 @@ void monitor_file(const char *path, const char *filename) {
   close(fd);
 }
 
-
-bool operator <(const timespec& lhs, const timespec& rhs)
-{
-    if (lhs.tv_sec == rhs.tv_sec)
-        return lhs.tv_nsec < rhs.tv_nsec;
-    else
-        return lhs.tv_sec < rhs.tv_sec;
-}
-
 /**
  * Select a candidate whose current usage is less than its limit.
  * If no such candidates, calculate the time until time window content changes and sleep until then,
@@ -280,7 +273,7 @@ bool operator <(const timespec& lhs, const timespec& rhs)
  * according to scheduling policy.
  * @return selected candidate
  */
-candidate_t select_candidate() {
+std::vector<candidate_t> select_candidates() {
   while (true) {
     /* update history list and get usage in a time interval */
     double window_size = WINDOW_SIZE;
@@ -318,16 +311,8 @@ candidate_t select_candidate() {
 
     /* select the candidate to give token */
 
-    // quick exit if the first one in candidates does not use GPU recently
-    auto check_appearance = [=](const History &h) -> bool {
-      return h.name == candidates.front().name;
-    };
-    if (std::find_if(history_list.begin(), history_list.end(), check_appearance) ==
-        history_list.end()) {
-      candidate_t selected = candidates.front();
-      candidates.pop_front();
-      return selected;
-    }
+    // no need for quick exit if the first one in candidates does not use GPU recently
+    // as it's better to return a valid candidate set directly
 
     // sort by time
     auto ts_comp = [=](container_timestamp a, container_timestamp b) -> bool {
@@ -375,7 +360,7 @@ candidate_t select_candidate() {
       current_time = std::abs(timestamp_vector[i].time);
     }
 
-    /* select the one to execute */
+    /* select the ones to execute */
     std::vector<valid_candidate_t> vaild_candidates;
 
     for (auto it = candidates.begin(); it != candidates.end(); it++) {
@@ -399,11 +384,18 @@ candidate_t select_candidate() {
     }
 
     std::sort(vaild_candidates.begin(), vaild_candidates.end(), schd_priority);
-
-    auto selected_iter = vaild_candidates.begin()->iter;
-    candidate_t result = *selected_iter;
-    candidates.erase(selected_iter);
-    return result;
+    /* iterate candidates and sum up all the used sm */
+    std::vector<candidate_t> approved_candidates;
+    for (auto it = vaild_candidates.begin(); it != vaild_candidates.end(); it++) {
+      string name = it->iter->name;
+      size_t sm_partition = client_info_map[name]->gpu_sm_partition;
+      if (g_sm_occupied + sm_partition < SM_GLOBAL_LIMIT){
+        approved_candidates.push_back(*(it->iter));
+	candidates.erase(it->iter);
+        g_sm_occupied += sm_partition;
+      }
+    }
+    return approved_candidates;
   }
 }
 
@@ -439,7 +431,7 @@ void handle_message(int client_sock, char *message) {
 
   } else if (req == REQ_MEM_LIMIT) {
 
-    prepare_response(sbuf, REQ_MEM_LIMIT, req_id, (size_t)0, client_inf->gpu_mem_limit);
+    prepare_response(sbuf, REQ_MEM_LIMIT, req_id, (size_t)client_inf->gpu_mem_used, client_inf->gpu_mem_limit);
     
      rc = multiple_attempt(
         [&]() -> int {
@@ -453,7 +445,21 @@ void handle_message(int client_sock, char *message) {
     // memory usage is only tracked on hook library side
     DEBUG(log_name, __FILE__, (long)__LINE__, "scheduler always returns true for memory usage update!");
 
-    prepare_response(sbuf, REQ_MEM_UPDATE, req_id, 1);
+    size_t bytes;
+    int is_allocate;
+    bytes = get_msg_data<size_t>(attached, offset);
+    is_allocate = get_msg_data<int>(attached, offset);
+
+    int verdict=0;
+    if (bytes>=0 && (is_allocate == 0 && client_inf->gpu_mem_used > bytes || is_allocate !=0 && client_inf->gpu_mem_used + bytes <= client_inf->gpu_mem_limit)){
+      if (is_allocate!=0)
+        client_inf->gpu_mem_used += bytes;
+      else
+        client_inf->gpu_mem_used -= bytes;
+      verdict = 1;
+    }
+
+    prepare_response(sbuf, REQ_MEM_UPDATE, req_id, verdict);
     
     rc = multiple_attempt(
         [&]() -> int {
@@ -467,6 +473,42 @@ void handle_message(int client_sock, char *message) {
   }
 }
 
+//check and clear expired tokens
+//if delivered tokens are zero, then there is no nearest waiting data
+//if a token expired, update info and schedule another round
+//else, we need to wait one of the token expires
+std::list<std::pair<timespec, size_t>> tokens_pair;
+std::list<std::pair<timespec, size_t>>::iterator min_tokenp;
+bool operator <(const timespec& lhs, const timespec& rhs)
+{
+    if (lhs.tv_sec == rhs.tv_sec)
+        return lhs.tv_nsec < rhs.tv_nsec;
+    else
+        return lhs.tv_sec < rhs.tv_sec;
+}
+bool update_tokens(){
+  bool should_wait = true;  //by default, the valid candidate are all delivered with its quota
+  struct timespec cur_ts;
+  clock_gettime(CLOCK_MONOTONIC, &cur_ts);
+  if (tokens_pair.size()==0) should_wait=false; // should not wait based on the running kernel, but pending directly
+  else {
+    auto iter = tokens_pair.begin();
+    while(iter!=tokens_pair.end()){
+        if(iter->first < cur_ts){ //expired
+            g_sm_occupied -= iter->second;
+            tokens_pair.erase(iter++);
+            should_wait = false; //quick way to schedule another round
+        }else{
+            iter++;
+        }
+    } 
+    min_tokenp = std::min_element(tokens_pair.begin(), tokens_pair.end(), 
+		    [](std::pair<timespec, size_t>& pairA, std::pair<timespec, size_t>& pairB)->bool{return pairA.first<pairB.first;}
+		    ); 
+  }
+  return should_wait;
+};
+ 
 void *schedule_daemon_func(void *) {
 #ifdef RANDOM_QUOTA
   std::random_device rd;
@@ -474,84 +516,74 @@ void *schedule_daemon_func(void *) {
   std::uniform_real_distribution<double> dis(0.4, 1.0);
 #endif
   double quota;
-  int tokenLimit = 5;
-  int tokenNum = 0;
-  std::list<timespec> tokens;
+  size_t sm_partition;
   //std::unordered_map<string, bool> scheduler_table;//@todo: remove evicted pod
 
   while (1) {
     pthread_mutex_lock(&candidate_mutex);
     if (candidates.size() != 0) {
       // remove an entry from candidates
-      candidate_t selected = select_candidate();
-      DEBUG(log_name, __FILE__, (long)__LINE__, "select %s, waiting time: %.3f ms", selected.name.c_str(),
-            ms_since_start() - selected.arrived_time);
+      update_tokens();//release the token to update sm info
+      auto selects = select_candidates();
+      if (selects.size() == 0){
+        DEBUG(log_name, __FILE__, (long)__LINE__, "no valid candidates");
+	pthread_cond_wait(&candidate_cond, &candidate_mutex);
+        pthread_mutex_unlock(&candidate_mutex);
+	continue;
+      }
+      for (auto selected: selects){
+        DEBUG(log_name, __FILE__, (long)__LINE__, "select %s, waiting time: %.3f ms", selected.name.c_str(),
+              ms_since_start() - selected.arrived_time);
 
-      quota = client_info_map[selected.name]->get_quota();
-#ifdef RANDOM_QUOTA
-      quota *= dis(gen);
-#endif
-      client_info_map[selected.name]->Record(quota);
+        quota = client_info_map[selected.name]->get_quota();
+        sm_partition = client_info_map[selected.name]->gpu_sm_partition;
+#ifdef  RANDOM_QUOTA
+        quota *= dis(gen);
+#endif 
+        client_info_map[selected.name]->Record(quota);
 
-      pthread_mutex_unlock(&candidate_mutex);
+        pthread_mutex_unlock(&candidate_mutex);
 
-      // send quota to selected instance
-      char sbuf[RSP_MSG_LEN];
-      bzero(sbuf, RSP_MSG_LEN);
-      prepare_response(sbuf, REQ_QUOTA, selected.req_id, quota);
+        // send quota to selected instance
+        char sbuf[RSP_MSG_LEN];
+        bzero(sbuf, RSP_MSG_LEN);
+        prepare_response(sbuf, REQ_QUOTA, selected.req_id, quota);
 
-      int rc, MAX_RETRY=5;
-      rc = multiple_attempt(
-        [&]() -> int {
-          if(send(selected.socket, sbuf, RSP_MSG_LEN, 0) == -1){
-              DEBUG(log_name, __FILE__, (long)__LINE__, "%s schedule_daemon_func - send error %s", selected.name.c_str(), strerror(errno));
-             return -1;
-          }
-        },
-        MAX_RETRY, 3);
+        int rc, MAX_RETRY=5;
+        rc = multiple_attempt(
+          [&]() -> int {
+            if(send(selected.socket, sbuf, RSP_MSG_LEN, 0) == -1){
+                DEBUG(log_name, __FILE__, (long)__LINE__, "%s schedule_daemon_func - send error %s", selected.name.c_str(), strerror(errno));
+               return -1;
+            }
+          },
+          MAX_RETRY, 3);
     
 
-      struct timespec ts = get_timespec_after(quota);
-      tokens.push_back(ts);
-      //if exceeded, then clear expired tokens
-      bool should_wait = false;
-      if (tokens.size()==5){
-          struct timespec cur_ts, min_ts;
-          clock_gettime(CLOCK_MONOTONIC, &cur_ts);
-	  min_ts = ts;
-	  auto iter = tokens.begin();
-          while(iter!=tokens.end()){
-	      if(*iter < cur_ts){ //expired
-	          tokens.erase(iter++);
-	      }else{
-                  min_ts = std::min(*iter, min_ts); 
-		  iter++;
-	      }
-	  } 
-          if (tokens.size()==5){
-              should_wait = true;
-              ts = min_ts;
-          }
+        struct timespec ts = get_timespec_after(quota);
+        tokens_pair.push_back({ts, sm_partition});
       }
+
+      bool should_wait = update_tokens();
 
       // wait until the selected one's quota time out
       pthread_mutex_lock(&candidate_mutex);
       while (should_wait) {
-        int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
+        int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &(min_tokenp->first));
 	//just wait at then; in most cases, it's ok
         if (rc == ETIMEDOUT) {
           //DEBUG(log_name, __FILE__, (long)__LINE__, "the first didn't return on time");
           should_wait = false;
+	  tokens_pair.erase(min_tokenp);
+          g_sm_occupied -= min_tokenp->second;
         } else {
-	  ///return too early
-          // check if the selected one comes back
-          ///for (auto conn : candidates) {
-          ///  if (conn.name == selected.name) {
-          ///  //if (scheduler_table[conn.name]) { // if it is one of the given token
-          ///    should_wait = false;
-          ///    break;
-          ///  }
-          ///}
+          //ignore new incoming request except its partition fits current remaining resources 
+	  for (auto conn : candidates) {
+            if (client_info_map[conn.name]->gpu_sm_partition + g_sm_occupied < SM_GLOBAL_LIMIT) {
+              should_wait = false;
+              break;
+            }
+          }
         }
       }
       pthread_mutex_unlock(&candidate_mutex);

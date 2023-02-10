@@ -19,7 +19,6 @@
 
 #include <unistd.h>
 
-#include <cerrno>
 #include <climits>
 #include <cstdarg>
 #include <cstdlib>
