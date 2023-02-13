@@ -251,7 +251,7 @@ void configure_connection() {
   char *port = getenv("POD_MANAGER_PORT");
   if (port != NULL) pod_manager_port = atoi(port);
 
-  DEBUG(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
+  hDEBUG(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
   hINFO(log_name, __FILE__, (long)__LINE__, "Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
 }
 
@@ -333,7 +333,7 @@ int communicate(char *sbuf, char *rbuf, int socket_timeout) {
  */
 void host_sync_call(const char *func_name) {
 #ifdef SYNCP_MESSAGE
-  DEBUG(log_name, __FILE__, (long)__LINE__, "SYNC (%s)", func_name);
+  hDEBUG(log_name, __FILE__, (long)__LINE__, "SYNC (%s)", func_name);
 #endif
   burst_predictor.record_stop();
   window_predictor.record_start();
@@ -412,7 +412,7 @@ double estimate_full_burst(double measured_burst, double measured_window) {
     if (measured_window < SCHD_OVERHEAD) full_burst *= 2;  // '2' can be changed to any value > 1
   }
 
-  DEBUG(log_name, __FILE__, (long)__LINE__, "measured burst: %.3f ms, window: %.3f ms, estimated full burst: %.3f ms", measured_burst,
+  hDEBUG(log_name, __FILE__, (long)__LINE__, "measured burst: %.3f ms, window: %.3f ms, estimated full burst: %.3f ms", measured_burst,
         measured_window, full_burst);
   return full_burst;
 }
@@ -441,7 +441,7 @@ double get_token_from_scheduler(double next_burst) {
   attached = parse_response(rbuf, nullptr);
   new_quota = get_msg_data<double>(attached, rpos);
 
-  DEBUG(log_name, __FILE__, (long)__LINE__, "Get token from scheduler, quota: %f", new_quota);
+  hDEBUG(log_name, __FILE__, (long)__LINE__, "Get token from scheduler, quota: %f", new_quota);
   return new_quota;
 }
 
@@ -474,7 +474,7 @@ void *wait_cuda_kernels(void *args) {
     pthread_mutex_lock(&overuse_trk_mutex);
     int rc = pthread_cond_timedwait(&overuse_trk_intr_cond, &overuse_trk_mutex, &ts);
     if (rc != ETIMEDOUT) {
-      DEBUG(log_name, __FILE__, (long)__LINE__, "overuse tracking thread interrupted");
+      hDEBUG(log_name, __FILE__, (long)__LINE__, "overuse tracking thread interrupted");
     }
     pthread_mutex_unlock(&overuse_trk_mutex);
 
@@ -491,7 +491,7 @@ void *wait_cuda_kernels(void *args) {
     cudaEventElapsedTime(&elapsed_ms, cuevent_start, event);
     overuse = std::max(0.0, (double)elapsed_ms - quota_time);
 
-    DEBUG(log_name, __FILE__, (long)__LINE__, "overuse: %.3f ms", overuse);
+    hDEBUG(log_name, __FILE__, (long)__LINE__, "overuse: %.3f ms", overuse);
     // notify tracking complete
     pthread_mutex_lock(&overuse_trk_mutex);
     overuse_trk_cmpl = true;
@@ -517,9 +517,11 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
   pthread_mutex_lock(&expiration_status_mutex);
   // allow the kernel to launch if kernel burst already begins;
   // otherwise, obtain a new token if this kernel burst may cause overuse
-  //if (!burst_predictor.ongoing_unmerged() &&
-  if(us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
+  DEBUG(log_name, __FILE__, (long)__LINE__, "estimitaed_burst_time: %ld", us_since(request_start) / 1e3 + burst_predictor.predict_unmerged());
+  if (!burst_predictor.ongoing_unmerged() &&
+      us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
     // estimate the duration of next kernel burst (merged)
+    fprintf(stderr, "yyds!");
     next_burst =
         estimate_full_burst(burst_predictor.predict_merged(), window_predictor.predict_merged());
 
@@ -570,7 +572,7 @@ CUresult cuLaunchCooperativeKernel_prehook(CUfunction f, unsigned int gridDimX,
 CUresult cuMemFree_prehook(CUdeviceptr ptr) {
   pthread_mutex_lock(&allocation_mutex);
   if (allocation_map.find(ptr) == allocation_map.end()) {
-    DEBUG(log_name, __FILE__, (long)__LINE__, "Freeing unknown memory! %zx", ptr);
+    hDEBUG(log_name, __FILE__, (long)__LINE__, "Freeing unknown memory! %zx", ptr);
   } else {
     gpu_mem_used -= allocation_map[ptr];
     update_memory_usage(allocation_map[ptr], 0);
@@ -592,10 +594,10 @@ CUresult cuMemAlloc_prehook(CUdeviceptr *dptr, size_t bytesize) {
   std::tie(remain, limit) = get_gpu_memory_info();
 
   // block allocation request before over-allocate
-  //if (bytesize > remain) {
-  //  //DEBUG(log_name, __FILE__, (long)__LINE__, "Allocate too much memory! (request: %lu B, remain: %lu B)", bytesize, remain);
-  //  //return CUDA_ERROR_OUT_OF_MEMORY;
-  //}
+  if (bytesize > remain) {
+    hERROR(log_name, __FILE__, (long)__LINE__, "Allocate too much memory! (request: %lu B, remain: %lu B)", bytesize, remain);
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   return CUDA_SUCCESS;
 }
@@ -603,10 +605,10 @@ CUresult cuMemAlloc_prehook(CUdeviceptr *dptr, size_t bytesize) {
 // push memory allocation information to backend
 CUresult cuMemAlloc_posthook(CUdeviceptr *dptr, size_t bytesize) {
   // send memory usage update to backend
-  //if (!update_memory_usage(bytesize, 1)) {
-  //  DEBUG(log_name, __FILE__, (long)__LINE__, "Allocate too much memory!");
-  //  //return CUDA_ERROR_OUT_OF_MEMORY;//Make a bypass temporarilly
-  //}
+  if (!update_memory_usage(bytesize, 1)) {
+    hERROR(log_name, __FILE__, (long)__LINE__, "Allocate too much memory!");
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   pthread_mutex_lock(&allocation_mutex);
   allocation_map[*dptr] = bytesize;
