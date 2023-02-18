@@ -57,6 +57,13 @@
 #include "debug.h"
 #include "predictor.h"
 #include "util.h"
+#include <chrono>
+using std::string;
+using std::chrono::duration_cast;
+using std::chrono::microseconds;
+using std::chrono::steady_clock;
+
+
 CUresult CUDAAPI cuMemAlloc_hook( CUdeviceptr* dptr, size_t bytesize) {
   cuMemAlloc(dptr,bytesize); 
   printf("allocate %zu bytes.\n", bytesize);
@@ -173,6 +180,7 @@ const int NET_OP_RETRY_INTV = 10;  // seconds between two retries
 /* GPU computation resource usage */
 double quota_time = 0;  // time quota from scheduler
 double overuse = 0;     // overuse time (ms)
+auto PROGRESS_START = steady_clock::now();
 pthread_mutex_t request_time_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // predictors
@@ -207,6 +215,11 @@ long long us_since(struct timespec begin) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   return (now.tv_sec - begin.tv_sec) * 1000000LL + (now.tv_nsec - begin.tv_nsec) / 1000LL;
+}
+
+// milliseconds since scheduler process started
+inline double ms_since_start() {
+  return duration_cast<microseconds>(steady_clock::now() - PROGRESS_START).count() / 1e3;
 }
 
 /**
@@ -517,13 +530,12 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
   double new_quota, next_burst;
 
   window_predictor.record_stop();
-
   pthread_mutex_lock(&expiration_status_mutex);
   // allow the kernel to launch if kernel burst already begins;
   // otherwise, obtain a new token if this kernel burst may cause overuse
-  DEBUG(log_name, __FILE__, (long)__LINE__, "estimitaed_burst_time: %ld", us_since(request_start) / 1e3 + burst_predictor.predict_unmerged());
-  if (!burst_predictor.ongoing_unmerged() &&
-      us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
+  //DEBUG(log_name, __FILE__, (long)__LINE__, "estimitaed_burst_time: %ld with the addr: %x", request_start.tv_sec, &request_start);
+  //if(us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
+  if(ms_since_start() >= quota_time) {
     // estimate the duration of next kernel burst (merged)
     next_burst =
         estimate_full_burst(burst_predictor.predict_merged(), window_predictor.predict_merged());
@@ -545,8 +557,11 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     // ensure predicted kernel burst is always less than quota
     burst_predictor.set_upperbound(new_quota - 1.0);
 
+    //DEBUG(log_name, __FILE__, (long)__LINE__, "2us since request time: %ld with the addr: %x", us_since(request_start) / 1e3, &request_start);
     cudaEventRecord(cuevent_start, 0);
+    PROGRESS_START = steady_clock::now();
     clock_gettime(CLOCK_MONOTONIC, &request_start);  // time
+    DEBUG(log_name, __FILE__, (long)__LINE__, "Got the time elapsed:%f", ms_since_start());
 
     quota_time = new_quota;
 
@@ -816,6 +831,7 @@ void initialize() {
   // first token request
   overuse_trk_cmpl = true;  // bypass first overuse tracking to prevent deadlock
   get_token_from_scheduler(0.0);
+  clock_gettime(CLOCK_MONOTONIC, &request_start);
 
   pthread_mutex_unlock(&request_time_mutex);
 
@@ -837,7 +853,7 @@ CUstream hStream;  // redundent variable used for macro expansion
 
 #define CU_HOOK_GENERATE_INTERCEPT(hook_name, hooksymbol, funcname, params, ...)                     \
   CUresult CUDAAPI hook_name params {                                                      \
-    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
     static void *real_func;                                                               \
@@ -859,7 +875,7 @@ CUstream hStream;  // redundent variable used for macro expansion
   }                                                                                       
 #define CU_HOOK_GENERATE_INTERCEPT_managed(hook_name, hooksymbol, funcname, oldparams, params, ...)                     \
   CUresult CUDAAPI hook_name oldparams {                                                      \
-    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
     static void *real_func;                                                               \
@@ -1068,7 +1084,7 @@ CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersio
 //generate hook for cuda >= 11.3
 #define CU_HOOK_GENERATE_INTERCEPT_v1(hooksymbol, funcname, params, ...)                     \
   CUresult CUDAAPI funcname params {                                                      \
-    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
     static void *real_func;                                                               \
@@ -1092,7 +1108,7 @@ CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersio
 
 #define CU_HOOK_GENERATE_INTERCEPT_v1_managed(hooksymbol, funcname, oldparams, params, ...)                     \
   CUresult CUDAAPI funcname oldparams {                                                   \
-    if (hook_inf.debug_mode) DEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
+    if (hook_inf.debug_mode) hDEBUG(log_name, __FILE__, (long)__LINE__, "hooked function: " CUDA_SYMBOL_STRING(hooksymbol));   \
     pthread_once(&init_done, initialize);                                                 \
                                                                                           \
     static void *real_func = (void *)real_dlsym(RTLD_NEXT, "cuMemAllocManaged");          \
