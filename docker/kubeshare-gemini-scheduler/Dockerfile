@@ -4,18 +4,18 @@ FROM nvidia/cuda:10.0-devel AS build
 
 WORKDIR /tmp/build
 
-COPY . Gemini
 RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub
 RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64/7fa2af80.pub
 
 RUN apt update && \
     echo "yes" | apt-get install libzmq3-dev && \
-    apt install -y git && \
-    cd Gemini && \
+    apt install -y git
+
+COPY . Gemini
+RUN cd Gemini && \
     make -C src DEBUG=1 
 
 FROM python:3.8.1-buster
-
 RUN pip3 install inotify
 
 ENV NVIDIA_VISIBLE_DEVICES      all

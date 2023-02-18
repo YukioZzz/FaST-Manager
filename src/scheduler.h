@@ -68,6 +68,7 @@ struct candidate_t {
   std::string name;  // container name
   reqid_t req_id;
   double arrived_time;
+  double expired_time; 
 };
 
 struct valid_candidate_t {
