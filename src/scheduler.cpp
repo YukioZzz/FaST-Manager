@@ -363,6 +363,7 @@ std::vector<candidate_t> select_candidates() {
     /* select the ones to execute */
     std::vector<valid_candidate_t> vaild_candidates;
 
+    pthread_mutex_lock(&candidate_mutex);
     for (auto it = candidates.begin(); it != candidates.end(); it++) {
       string name = it->name;
       double limit, require, missing, remaining;
@@ -390,7 +391,7 @@ std::vector<candidate_t> select_candidates() {
     for (auto it = vaild_candidates.begin(); it != vaild_candidates.end(); it++) {
       string name = it->iter->name;
       size_t sm_partition = client_info_map[name]->gpu_sm_partition;
-      if (g_sm_occupied + sm_partition < SM_GLOBAL_LIMIT){
+      if (g_sm_occupied + sm_partition <= SM_GLOBAL_LIMIT){
         approved_candidates.push_back(*(it->iter));
 	candidates.erase(it->iter);
       }
@@ -403,6 +404,7 @@ std::vector<candidate_t> select_candidates() {
       pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
       continue;  // go to begin of loop
     }
+    pthread_mutex_unlock(&candidate_mutex);
     return approved_candidates;
   }
 }
@@ -497,10 +499,9 @@ bool operator <(const timespec& lhs, const timespec& rhs)
 bool update_tokens(){
   bool should_wait = true;  //by default, the valid candidate are all delivered with its quota
   auto now = ms_since_start();
-  DEBUG(log_name, __FILE__, (long)__LINE__, "entering the update_tokens");
   if (tokenTakers.size()==0) should_wait=false; // should not wait based on the running kernel, but pending directly
   else {
-    DEBUG(log_name, __FILE__, (long)__LINE__, "tokenTaker not empty!");
+    DEBUG(log_name, __FILE__, (long)__LINE__, "tokenTaker not empty with size %d", tokenTakers.size());
     auto iter = tokenTakers.begin();
     while(iter!=tokenTakers.end()){
         if(iter->expired_time <= now){ //expired
@@ -509,9 +510,7 @@ bool update_tokens(){
             tokenTakers.erase(iter++);
             should_wait = false; //quick way to schedule another round
         }else{
-            DEBUG(log_name, __FILE__, (long)__LINE__, "%s is still holding its token", iter->name.c_str());
-            //DEBUG(log_name, __FILE__, (long)__LINE__, "%s is still holding its token with gpu_partition %d", iter->name, client_info_map[iter->name]->gpu_sm_partition);
-            DEBUG(log_name, __FILE__, (long)__LINE__, "some one is still holding the token.");
+            DEBUG(log_name, __FILE__, (long)__LINE__, "%s is still holding its token with quota %f", iter->name.c_str(), iter->expired_time-now);
             iter++;
         }
     } 
@@ -523,15 +522,18 @@ bool update_tokens(){
   return should_wait;
 };
 
-void remove_ifexists(string name){
+bool remove_ifexists(string name){
     auto iter = tokenTakers.begin();
     while(iter != tokenTakers.end()){
        if(iter->name == name){
+         DEBUG(log_name, __FILE__, (long)__LINE__, "the candidate %s returns early", iter->name.c_str());
 	 g_sm_occupied -= client_info_map[iter->name]->gpu_sm_partition;
          tokenTakers.erase(iter); 
-	 break;
+	 return true;
        }
+       iter++;
     }
+    return false;
 }
  
 void *schedule_daemon_func(void *) {
@@ -547,6 +549,7 @@ void *schedule_daemon_func(void *) {
   while (1) {
     pthread_mutex_lock(&candidate_mutex);
     if (candidates.size() != 0) {
+      pthread_mutex_unlock(&candidate_mutex);
       // remove an entry from candidates
       update_tokens();//release the token to update sm info
       auto selects = select_candidates();
@@ -560,8 +563,6 @@ void *schedule_daemon_func(void *) {
         quota *= dis(gen);
 #endif 
         client_info_map[selected.name]->Record(quota);
-
-        pthread_mutex_unlock(&candidate_mutex);
 
         // send quota to selected instance
         char sbuf[RSP_MSG_LEN];
@@ -589,12 +590,13 @@ void *schedule_daemon_func(void *) {
       pthread_mutex_lock(&candidate_mutex);
       DEBUG(log_name, __FILE__, (long)__LINE__, "current token lists' size:%d", tokenTakers.size());
       while (should_wait) {
-        DEBUG(log_name, __FILE__, (long)__LINE__, "waiting as we should wait");
 	auto now = ms_since_start();
-	struct timespec duration_ts;
-	if (min_tokenp->expired_time < now) duration_ts = {0};
-	else duration_ts = get_timespec_after(min_tokenp->expired_time - ms_since_start());
-        int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &(duration_ts));
+	double duration_ts = 0.0;
+	if (min_tokenp->expired_time > now)
+          duration_ts = min_tokenp->expired_time - now;
+        auto wakeupTime = get_timespec_after(duration_ts);
+        DEBUG(log_name, __FILE__, (long)__LINE__, "waiting %f s as we should wait", duration_ts);
+        int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &(wakeupTime));
 	//just wait at then; in most cases, it's ok
         if (rc == ETIMEDOUT) {
           DEBUG(log_name, __FILE__, (long)__LINE__, "the candidate %s didn't return on time with size:%d", min_tokenp->name.c_str(), tokenTakers.size());
@@ -602,16 +604,19 @@ void *schedule_daemon_func(void *) {
           g_sm_occupied -= client_info_map[min_tokenp->name]->gpu_sm_partition;
 	  tokenTakers.erase(min_tokenp);
         } else {
-          //ignore new incoming request except its partition fits current remaining resources 
+          //ignore new incoming request except it returns fast or its partition fits current remaining resources 
 	  for (auto conn : candidates) {
-            if (client_info_map[conn.name]->gpu_sm_partition + g_sm_occupied < SM_GLOBAL_LIMIT) {
-	      remove_ifexists(conn.name);//return fast
+          DEBUG(log_name, __FILE__, (long)__LINE__, "the candidate %s is comming", conn.name.c_str());
+            if (remove_ifexists(conn.name) || client_info_map[conn.name]->gpu_sm_partition + g_sm_occupied <= SM_GLOBAL_LIMIT) {
+               DEBUG(log_name, __FILE__, (long)__LINE__, "quit early");
               should_wait = false;
               break;
             }
           }
+          DEBUG(log_name, __FILE__, (long)__LINE__, "quit not early");
         }
       }
+      DEBUG(log_name, __FILE__, (long)__LINE__, "continue next round");
       pthread_mutex_unlock(&candidate_mutex);
     } else {
       // wait for incoming connections
