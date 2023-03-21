@@ -374,6 +374,7 @@ std::vector<candidate_t> select_candidates() {
       if (remaining > 0)
         vaild_candidates.push_back({missing, remaining, usage[it->name], it->arrived_time, it});
     }
+    pthread_mutex_unlock(&candidate_mutex);
     DEBUG(log_name, __FILE__, (long)__LINE__, "current valid candidates' size:%d", vaild_candidates.size());
 
     if (vaild_candidates.size() == 0) {
@@ -381,7 +382,9 @@ std::vector<candidate_t> select_candidates() {
       auto ts = get_timespec_after(history_list.begin()->end - window_start);
       DEBUG(log_name, __FILE__, (long)__LINE__, "sleep until %ld.%03ld", ts.tv_sec, ts.tv_nsec / 1000000);
       // also wakes up if new requests come in
+      pthread_mutex_lock(&candidate_mutex);
       pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
+      pthread_mutex_unlock(&candidate_mutex);
       continue;  // go to begin of loop
     }
 
@@ -393,7 +396,9 @@ std::vector<candidate_t> select_candidates() {
       size_t sm_partition = client_info_map[name]->gpu_sm_partition;
       if (g_sm_occupied + sm_partition <= SM_GLOBAL_LIMIT){
         approved_candidates.push_back(*(it->iter));
+        pthread_mutex_lock(&candidate_mutex);
 	candidates.erase(it->iter);
+        pthread_mutex_unlock(&candidate_mutex);
       }
     }
     if (approved_candidates.size() == 0) {
@@ -401,10 +406,11 @@ std::vector<candidate_t> select_candidates() {
       auto ts = get_timespec_after(history_list.begin()->end - window_start);
       DEBUG(log_name, __FILE__, (long)__LINE__, "no approved candidates, sleep until %ld.%03ld", ts.tv_sec, ts.tv_nsec / 1000000);
       // also wakes up if new requests come in
+      pthread_mutex_lock(&candidate_mutex);
       pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
+      pthread_mutex_unlock(&candidate_mutex);
       continue;  // go to begin of loop
     }
-    pthread_mutex_unlock(&candidate_mutex);
     return approved_candidates;
   }
 }
@@ -595,7 +601,7 @@ void *schedule_daemon_func(void *) {
 	if (min_tokenp->expired_time > now)
           duration_ts = min_tokenp->expired_time - now;
         auto wakeupTime = get_timespec_after(duration_ts);
-        DEBUG(log_name, __FILE__, (long)__LINE__, "waiting %f s as we should wait", duration_ts);
+        DEBUG(log_name, __FILE__, (long)__LINE__, "waiting %f ms as we should wait", duration_ts);
         int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &(wakeupTime));
 	//just wait at then; in most cases, it's ok
         if (rc == ETIMEDOUT) {
