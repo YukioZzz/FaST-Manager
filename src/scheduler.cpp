@@ -204,7 +204,7 @@ void read_resource_config() {
   INFO(log_name, __FILE__, (long)__LINE__, "There are %d clients in the system...", container_num);
   for (int i = 0; i < container_num; i++) {
     fin >> client_name >> gpu_min_fraction >> gpu_max_fraction >> sm_partition >> gpu_memory_size;
-    client_inf = new ClientInfo(QUOTA, MIN_QUOTA, gpu_max_fraction * WINDOW_SIZE, gpu_min_fraction,
+    client_inf = new ClientInfo(QUOTA, MIN_QUOTA, gpu_min_fraction * WINDOW_SIZE, gpu_min_fraction,
                                 gpu_max_fraction);
     client_inf->name = client_name;
     client_inf->gpu_sm_partition = sm_partition;
@@ -279,19 +279,14 @@ std::vector<candidate_t> select_candidates() {
     double window_size = WINDOW_SIZE;
     int overlap_cnt = 0, i, j, k;
     std::map<string, double> usage;
-    struct container_timestamp {
-      string name;
-      double time;
-    };
 
-    // start/end timestamp of history in this window
-    std::vector<container_timestamp> timestamp_vector;
     // instances to check for overlap
     std::vector<string> overlap_check_vector;
 
     double now = ms_since_start();
     double window_start = now - WINDOW_SIZE;
     double current_time;
+    current_time = window_start;
     if (window_start < 0) {
       // elapsed time less than a window size
       window_size = now;
@@ -300,9 +295,7 @@ std::vector<candidate_t> select_candidates() {
     auto beyond_window = [=](const History &h) -> bool { return h.end < window_start; };
     history_list.remove_if(beyond_window);
     for (auto h : history_list) {
-      timestamp_vector.push_back({h.name, -h.start});
-      timestamp_vector.push_back({h.name, h.end});
-      usage[h.name] = 0;
+      usage[h.name] += h.end - std::max(h.start, current_time);
       if (verbosity > 1) {
         printf("{'container': '%s', 'start': %.3f, 'end': %.3f},\n", h.name.c_str(), h.start / 1e3,
                h.end / 1e3);
@@ -315,55 +308,11 @@ std::vector<candidate_t> select_candidates() {
     // as it's better to return a valid candidate set directly
 
     // sort by time
-    auto ts_comp = [=](container_timestamp a, container_timestamp b) -> bool {
-      return std::abs(a.time) < std::abs(b.time);
-    };
-    std::sort(timestamp_vector.begin(), timestamp_vector.end(), ts_comp);
-
-    /* calculate overall utilization */
-    current_time = window_start;
-    for (k = 0; k < timestamp_vector.size(); k++) {
-      if (std::abs(timestamp_vector[k].time) <= window_start) {
-        // start before this time window
-        overlap_cnt++;
-        overlap_check_vector.push_back(timestamp_vector[k].name);
-      } else {
-        break;
-      }
-    }
-
-    // i >= k: events in this time window
-    for (i = k; i < timestamp_vector.size(); ++i) {
-      // instances in overlap_check_vector overlaps,
-      // overlapped interval = current_time ~ i-th timestamp
-      for (j = 0; j < overlap_check_vector.size(); ++j)
-        usage[overlap_check_vector[j]] +=
-            (std::abs(timestamp_vector[i].time) - current_time) / overlap_cnt;
-
-      if (timestamp_vector[i].time < 0) {
-        // is a "start" timestamp
-        overlap_check_vector.push_back(timestamp_vector[i].name);
-        overlap_cnt++;
-      } else {
-        // is a "end" timestamp
-        // remove instance from overlap_check_vector
-        for (j = 0; j < overlap_check_vector.size(); ++j) {
-          if (overlap_check_vector[j] == timestamp_vector[i].name) {
-            overlap_check_vector.erase(overlap_check_vector.begin() + j);
-            break;
-          }
-        }
-        overlap_cnt--;
-      }
-
-      // advance current_time
-      current_time = std::abs(timestamp_vector[i].time);
-    }
-
     /* select the ones to execute */
     std::vector<valid_candidate_t> vaild_candidates;
 
     pthread_mutex_lock(&candidate_mutex);
+    double waittime = 2000; //2s
     for (auto it = candidates.begin(); it != candidates.end(); it++) {
       string name = it->name;
       double limit, require, missing, remaining;
@@ -371,16 +320,19 @@ std::vector<candidate_t> select_candidates() {
       require = client_info_map[name]->get_min_fraction() * window_size;
       missing = require - usage[name];
       remaining = limit - usage[name];
+
       if (remaining > 0)
         vaild_candidates.push_back({missing, remaining, usage[it->name], it->arrived_time, it});
+      else
+	waittime = std::min(waittime, -remaining);
     }
     pthread_mutex_unlock(&candidate_mutex);
     DEBUG(log_name, __FILE__, (long)__LINE__, "current valid candidates' size:%d", vaild_candidates.size());
 
     if (vaild_candidates.size() == 0) {
       // all candidates reach usage limit
-      auto ts = get_timespec_after(history_list.begin()->end - window_start);
-      DEBUG(log_name, __FILE__, (long)__LINE__, "sleep until %ld.%03ld", ts.tv_sec, ts.tv_nsec / 1000000);
+      auto ts = get_timespec_after(waittime);
+      DEBUG(log_name, __FILE__, (long)__LINE__, "sleep time %d ms", waittime); 
       // also wakes up if new requests come in
       pthread_mutex_lock(&candidate_mutex);
       pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
